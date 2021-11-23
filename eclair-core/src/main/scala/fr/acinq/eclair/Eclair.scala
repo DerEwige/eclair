@@ -130,11 +130,11 @@ trait Eclair {
 
   def channelStats(from: TimestampSecond, to: TimestampSecond)(implicit timeout: Timeout): Future[Seq[Stats]]
 
-  def getInvoice(paymentHash: ByteVector32)(implicit timeout: Timeout): Future[Option[Bolt11Invoice]]
+  def getInvoice(paymentHash: ByteVector32)(implicit timeout: Timeout): Future[Option[Invoice]]
 
-  def pendingInvoices(from: TimestampSecond, to: TimestampSecond)(implicit timeout: Timeout): Future[Seq[Bolt11Invoice]]
+  def pendingInvoices(from: TimestampSecond, to: TimestampSecond)(implicit timeout: Timeout): Future[Seq[Invoice]]
 
-  def allInvoices(from: TimestampSecond, to: TimestampSecond)(implicit timeout: Timeout): Future[Seq[Bolt11Invoice]]
+  def allInvoices(from: TimestampSecond, to: TimestampSecond)(implicit timeout: Timeout): Future[Seq[Invoice]]
 
   def deleteInvoice(paymentHash: ByteVector32): Future[String]
 
@@ -342,7 +342,7 @@ class EclairImpl(appKit: Kit) extends Eclair with Logging {
         externalId_opt match {
           case Some(externalId) if externalId.length > externalIdMaxLength => Left(new IllegalArgumentException(s"externalId is too long: cannot exceed $externalIdMaxLength characters"))
           case _ if invoice.isExpired() => Left(new IllegalArgumentException("invoice has expired"))
-          case _ => Right(SendPaymentToNode(amount, invoice, maxAttempts, externalId_opt, routeParams = routeParams))
+          case _ => Right(SendPaymentToNode(ActorRef.noSender, amount, invoice, maxAttempts, externalId_opt, routeParams = routeParams))
         }
       case Left(t) => Left(t)
     }
@@ -427,15 +427,15 @@ class EclairImpl(appKit: Kit) extends Eclair with Logging {
     Future(appKit.nodeParams.db.audit.stats(from.toTimestampMilli, to.toTimestampMilli))
   }
 
-  override def allInvoices(from: TimestampSecond, to: TimestampSecond)(implicit timeout: Timeout): Future[Seq[Bolt11Invoice]] = Future {
+  override def allInvoices(from: TimestampSecond, to: TimestampSecond)(implicit timeout: Timeout): Future[Seq[Invoice]] = Future {
     appKit.nodeParams.db.payments.listIncomingPayments(from.toTimestampMilli, to.toTimestampMilli).map(_.invoice)
   }
 
-  override def pendingInvoices(from: TimestampSecond, to: TimestampSecond)(implicit timeout: Timeout): Future[Seq[Bolt11Invoice]] = Future {
+  override def pendingInvoices(from: TimestampSecond, to: TimestampSecond)(implicit timeout: Timeout): Future[Seq[Invoice]] = Future {
     appKit.nodeParams.db.payments.listPendingIncomingPayments(from.toTimestampMilli, to.toTimestampMilli).map(_.invoice)
   }
 
-  override def getInvoice(paymentHash: ByteVector32)(implicit timeout: Timeout): Future[Option[Bolt11Invoice]] = Future {
+  override def getInvoice(paymentHash: ByteVector32)(implicit timeout: Timeout): Future[Option[Invoice]] = Future {
     appKit.nodeParams.db.payments.getIncomingPayment(paymentHash).map(_.invoice)
   }
 
