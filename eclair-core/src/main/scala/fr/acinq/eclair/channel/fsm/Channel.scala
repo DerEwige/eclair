@@ -21,7 +21,7 @@ import akka.actor.typed.scaladsl.adapter.{ClassicActorContextOps, actorRefAdapte
 import akka.actor.{Actor, ActorContext, ActorRef, FSM, OneForOneStrategy, PossiblyHarmful, Props, SupervisorStrategy, typed}
 import akka.event.Logging.MDC
 import fr.acinq.bitcoin.scalacompat.Crypto.{PrivateKey, PublicKey}
-import fr.acinq.bitcoin.scalacompat.{ByteVector32, Satoshi, SatoshiLong, Transaction}
+import fr.acinq.bitcoin.scalacompat.{ByteVector32, KotlinUtils, Satoshi, SatoshiLong, Transaction}
 import fr.acinq.eclair.Logs.LogCategory
 import fr.acinq.eclair._
 import fr.acinq.eclair.blockchain.OnChainWallet.MakeFundingTxResponse
@@ -1243,10 +1243,14 @@ class Channel(val nodeParams: NodeParams, val wallet: OnChainChannelFunder, val 
       log.info("shutting down")
       stop(FSM.Normal)
 
-    case Event(MakeFundingTxResponse(fundingTx, _, _), _) =>
-      // this may happen if connection is lost, or remote sends an error while we were waiting for the funding tx to be created by our wallet
-      // in that case we rollback the tx
-      wallet.rollback(fundingTx)
+    case Event(resp: MakeFundingTxResponse, _) =>
+      resp.fundingTx() match {
+        case Left(error) => log.error(s"Cannot extract funding tx from psbt (${error.toString}")
+        case Right(fundingTx) =>
+          // this may happen if connection is lost, or remote sends an error while we were waiting for the funding tx to be created by our wallet
+          // in that case we rollback the tx
+          wallet.rollback(fundingTx)
+      }
       stay()
 
     case Event(INPUT_DISCONNECTED, _) => stay() // we are disconnected, but it doesn't matter anymore

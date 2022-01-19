@@ -20,7 +20,7 @@ import akka.actor.Status
 import akka.actor.typed.scaladsl.adapter.actorRefAdapter
 import akka.pattern.pipe
 import fr.acinq.bitcoin.ScriptFlags
-import fr.acinq.bitcoin.scalacompat.{SatoshiLong, Script, Transaction}
+import fr.acinq.bitcoin.scalacompat.{KotlinUtils, SatoshiLong, Script, Transaction}
 import fr.acinq.eclair.blockchain.OnChainWallet.MakeFundingTxResponse
 import fr.acinq.eclair.blockchain.bitcoind.ZmqWatcher._
 import fr.acinq.eclair.channel.Helpers.{Funding, getRelayFees}
@@ -154,8 +154,7 @@ trait ChannelOpenSingleFunder extends FundingHandlers with ErrorHandlers {
           log.debug("remote params: {}", remoteParams)
           log.info("remote will use fundingMinDepth={}", accept.minimumDepth)
           val localFundingPubkey = keyManager.fundingPublicKey(localParams.fundingKeyPath)
-          val fundingPubkeyScript = Script.write(Script.pay2wsh(Scripts.multiSig2of2(localFundingPubkey.publicKey, remoteParams.fundingPubKey)))
-          wallet.makeFundingTx(fundingPubkeyScript, fundingSatoshis, fundingTxFeerate).pipeTo(self)
+          wallet.makeFundingTx(nodeParams.chainHash, localFundingPubkey, remoteParams.fundingPubKey, fundingSatoshis, fundingTxFeerate).pipeTo(self)
           goto(WAIT_FOR_FUNDING_INTERNAL) using DATA_WAIT_FOR_FUNDING_INTERNAL(temporaryChannelId, localParams, remoteParams, fundingSatoshis, pushMsat, commitTxFeerate, accept.firstPerCommitmentPoint, channelConfig, channelFeatures, open)
       }
 
@@ -177,26 +176,30 @@ trait ChannelOpenSingleFunder extends FundingHandlers with ErrorHandlers {
   })
 
   when(WAIT_FOR_FUNDING_INTERNAL)(handleExceptions {
-    case Event(MakeFundingTxResponse(fundingTx, fundingTxOutputIndex, fundingTxFee), d@DATA_WAIT_FOR_FUNDING_INTERNAL(temporaryChannelId, localParams, remoteParams, fundingAmount, pushMsat, commitTxFeerate, remoteFirstPerCommitmentPoint, channelConfig, channelFeatures, open)) =>
-      // let's create the first commitment tx that spends the yet uncommitted funding tx
-      Funding.makeFirstCommitTxs(keyManager, channelConfig, channelFeatures, temporaryChannelId, localParams, remoteParams, fundingAmount, pushMsat, commitTxFeerate, fundingTx.hash, fundingTxOutputIndex, remoteFirstPerCommitmentPoint) match {
+    case Event(fundingTxResponse: MakeFundingTxResponse, d@DATA_WAIT_FOR_FUNDING_INTERNAL(temporaryChannelId, localParams, remoteParams, fundingAmount, pushMsat, commitTxFeerate, remoteFirstPerCommitmentPoint, channelConfig, channelFeatures, open)) =>
+      fundingTxResponse.fundingTx() match {
         case Left(ex) => handleLocalError(ex, d, None)
-        case Right((localSpec, localCommitTx, remoteSpec, remoteCommitTx)) =>
-          require(fundingTx.txOut(fundingTxOutputIndex).publicKeyScript == localCommitTx.input.txOut.publicKeyScript, s"pubkey script mismatch!")
-          val localSigOfRemoteTx = keyManager.sign(remoteCommitTx, keyManager.fundingPublicKey(localParams.fundingKeyPath), TxOwner.Remote, channelFeatures.commitmentFormat)
-          // signature of their initial commitment tx that pays remote pushMsat
-          val fundingCreated = FundingCreated(
-            temporaryChannelId = temporaryChannelId,
-            fundingTxid = fundingTx.hash,
-            fundingOutputIndex = fundingTxOutputIndex,
-            signature = localSigOfRemoteTx
-          )
-          val channelId = toLongId(fundingTx.hash, fundingTxOutputIndex)
-          peer ! ChannelIdAssigned(self, remoteNodeId, temporaryChannelId, channelId) // we notify the peer asap so it knows how to route messages
-          txPublisher ! SetChannelId(remoteNodeId, channelId)
-          context.system.eventStream.publish(ChannelIdAssigned(self, remoteNodeId, temporaryChannelId, channelId))
-          // NB: we don't send a ChannelSignatureSent for the first commit
-          goto(WAIT_FOR_FUNDING_SIGNED) using DATA_WAIT_FOR_FUNDING_SIGNED(channelId, localParams, remoteParams, fundingTx, fundingTxFee, localSpec, localCommitTx, RemoteCommit(0, remoteSpec, remoteCommitTx.tx.txid, remoteFirstPerCommitmentPoint), open.channelFlags, channelConfig, channelFeatures, fundingCreated) sending fundingCreated
+        case Right(fundingTx) =>
+          // let's create the first commitment tx that spends the yet uncommitted funding tx
+          Funding.makeFirstCommitTxs(keyManager, channelConfig, channelFeatures, temporaryChannelId, localParams, remoteParams, fundingAmount, pushMsat, commitTxFeerate, fundingTx.hash, fundingTxResponse.fundingTxOutputIndex, remoteFirstPerCommitmentPoint) match {
+            case Left(ex) => handleLocalError(ex, d, None)
+            case Right((localSpec, localCommitTx, remoteSpec, remoteCommitTx)) =>
+              require(fundingTx.txOut(fundingTxResponse.fundingTxOutputIndex).publicKeyScript == localCommitTx.input.txOut.publicKeyScript, s"pubkey script mismatch!")
+              val localSigOfRemoteTx = keyManager.sign(remoteCommitTx, keyManager.fundingPublicKey(localParams.fundingKeyPath), TxOwner.Remote, channelFeatures.commitmentFormat)
+              // signature of their initial commitment tx that pays remote pushMsat
+              val fundingCreated = FundingCreated(
+                temporaryChannelId = temporaryChannelId,
+                fundingTxid = fundingTx.hash,
+                fundingOutputIndex = fundingTxResponse.fundingTxOutputIndex,
+                signature = localSigOfRemoteTx
+              )
+              val channelId = toLongId(fundingTx.hash, fundingTxResponse.fundingTxOutputIndex)
+              peer ! ChannelIdAssigned(self, remoteNodeId, temporaryChannelId, channelId) // we notify the peer asap so it knows how to route messages
+              txPublisher ! SetChannelId(remoteNodeId, channelId)
+              context.system.eventStream.publish(ChannelIdAssigned(self, remoteNodeId, temporaryChannelId, channelId))
+              // NB: we don't send a ChannelSignatureSent for the first commit
+              goto(WAIT_FOR_FUNDING_SIGNED) using DATA_WAIT_FOR_FUNDING_SIGNED(channelId, localParams, remoteParams, fundingTx, fundingTxResponse.fee, localSpec, localCommitTx, RemoteCommit(0, remoteSpec, remoteCommitTx.tx.txid, remoteFirstPerCommitmentPoint), open.channelFlags, channelConfig, channelFeatures, fundingCreated) sending fundingCreated
+          }
       }
 
     case Event(Status.Failure(t), d: DATA_WAIT_FOR_FUNDING_INTERNAL) =>
