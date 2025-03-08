@@ -29,7 +29,7 @@ import fr.acinq.eclair.channel._
 import fr.acinq.eclair.db.PendingCommandsDb
 import fr.acinq.eclair.payment._
 import fr.acinq.eclair.wire.protocol._
-import fr.acinq.eclair.{CltvExpiryDelta, Logs, MilliSatoshi, NodeParams}
+import fr.acinq.eclair.{CltvExpiryDelta, Logs, MilliSatoshi, NodeParams, RealShortChannelId}
 import grizzled.slf4j.Logging
 
 import scala.concurrent.Promise
@@ -73,18 +73,18 @@ class Relayer(nodeParams: NodeParams, router: ActorRef, register: ActorRef, paym
         case Right(r: IncomingPaymentPacket.NodeRelayPacket) =>
           if (!nodeParams.enableTrampolinePayment) {
             log.warning(s"rejecting htlc #${add.id} from channelId=${add.channelId} reason=trampoline disabled")
-            PendingCommandsDb.safeSend(register, nodeParams.db.pendingCommands, add.channelId, CMD_FAIL_HTLC(add.id, Right(RequiredNodeFeatureMissing()), commit = true))
+            PendingCommandsDb.safeSend(register, nodeParams.db.pendingCommands, add.channelId, CMD_FAIL_HTLC(add.id, FailureReason.LocalFailure(RequiredNodeFeatureMissing()), commit = true))
           } else {
             nodeRelayer ! NodeRelayer.Relay(r, originNode)
           }
         case Left(badOnion: BadOnion) =>
           log.warning(s"couldn't parse onion: reason=${badOnion.message}")
           val cmdFail = badOnion match {
-            case _: InvalidOnionBlinding if add.blinding_opt.isEmpty =>
+            case _: InvalidOnionBlinding if add.pathKey_opt.isEmpty =>
               // We are the introduction point of a blinded path: we add a non-negligible delay to make it look like it
               // could come from a downstream node.
               val delay = Some(500.millis + Random.nextLong(1500).millis)
-              CMD_FAIL_HTLC(add.id, Right(InvalidOnionBlinding(badOnion.onionHash)), delay, commit = true)
+              CMD_FAIL_HTLC(add.id, FailureReason.LocalFailure(InvalidOnionBlinding(badOnion.onionHash)), delay, commit = true)
             case _ =>
               CMD_FAIL_MALFORMED_HTLC(add.id, badOnion.onionHash, badOnion.code, commit = true)
           }
@@ -92,7 +92,7 @@ class Relayer(nodeParams: NodeParams, router: ActorRef, register: ActorRef, paym
           PendingCommandsDb.safeSend(register, nodeParams.db.pendingCommands, add.channelId, cmdFail)
         case Left(failure) =>
           log.warning(s"rejecting htlc #${add.id} from channelId=${add.channelId} reason=$failure")
-          val cmdFail = CMD_FAIL_HTLC(add.id, Right(failure), commit = true)
+          val cmdFail = CMD_FAIL_HTLC(add.id, FailureReason.LocalFailure(failure), commit = true)
           PendingCommandsDb.safeSend(register, nodeParams.db.pendingCommands, add.channelId, cmdFail)
       }
 
@@ -134,6 +134,10 @@ object Relayer extends Logging {
     require(feeProportionalMillionths >= 0.0, "feeProportionalMillionths must be nonnegative")
   }
 
+  object RelayFees {
+    val zero: RelayFees = RelayFees(MilliSatoshi(0), 0)
+  }
+
   case class InboundFees(feeBase: MilliSatoshi, feeProportionalMillionths: Long)
 
   object InboundFees {
@@ -159,7 +163,7 @@ object Relayer extends Logging {
   }
 
   case class RelayForward(add: UpdateAddHtlc, originNode: PublicKey)
-  case class ChannelBalance(remoteNodeId: PublicKey, shortIds: ShortIds, canSend: MilliSatoshi, canReceive: MilliSatoshi, isPublic: Boolean, isEnabled: Boolean)
+  case class ChannelBalance(remoteNodeId: PublicKey, realScid: Option[RealShortChannelId], aliases: ShortIdAliases, canSend: MilliSatoshi, canReceive: MilliSatoshi, isPublic: Boolean, isEnabled: Boolean)
 
   sealed trait OutgoingChannelParams {
     def channelId: ByteVector32
@@ -173,11 +177,13 @@ object Relayer extends Logging {
    * @param enabledOnly if true, filter out disabled channels.
    */
   case class GetOutgoingChannels(enabledOnly: Boolean = true)
-  case class OutgoingChannel(shortIds: ShortIds, nextNodeId: PublicKey, channelUpdate: ChannelUpdate, prevChannelUpdate: Option[ChannelUpdate], commitments: Commitments) extends OutgoingChannelParams {
+  case class OutgoingChannel(aliases: ShortIdAliases, nextNodeId: PublicKey, channelUpdate: ChannelUpdate, prevChannelUpdate: Option[ChannelUpdate], lastAnnouncement: Option[ChannelAnnouncement], commitments: Commitments) extends OutgoingChannelParams {
     override val channelId: ByteVector32 = commitments.channelId
+    val realScid_opt: Option[RealShortChannelId] = lastAnnouncement.map(_.shortChannelId)
     def toChannelBalance: ChannelBalance = ChannelBalance(
       remoteNodeId = nextNodeId,
-      shortIds = shortIds,
+      realScid = realScid_opt,
+      aliases = aliases,
       canSend = commitments.availableBalanceForSend,
       canReceive = commitments.availableBalanceForReceive,
       isPublic = commitments.announceChannel,

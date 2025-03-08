@@ -56,9 +56,7 @@ sealed trait PaymentEvent {
 case class PaymentSent(id: UUID, paymentHash: ByteVector32, paymentPreimage: ByteVector32, recipientAmount: MilliSatoshi, recipientNodeId: PublicKey, parts: Seq[PaymentSent.PartialPayment]) extends PaymentEvent {
   require(parts.nonEmpty, "must have at least one payment part")
   val amountWithFees: MilliSatoshi = parts.map(_.amountWithFees).sum
-  val feesPaid: MilliSatoshi = amountWithFees - recipientAmount // overall fees for this payment (routing + trampoline)
-  val trampolineFees: MilliSatoshi = parts.map(_.amount).sum - recipientAmount
-  val nonTrampolineFees: MilliSatoshi = feesPaid - trampolineFees // routing fees to reach the first trampoline node, or the recipient if not using trampoline
+  val feesPaid: MilliSatoshi = amountWithFees - recipientAmount // overall fees for this payment
   val timestamp: TimestampMilli = parts.map(_.timestamp).min // we use min here because we receive the proof of payment as soon as the first partial payment is fulfilled
 }
 
@@ -152,7 +150,7 @@ case class LocalFailure(amount: MilliSatoshi, route: Seq[Hop], t: Throwable) ext
 case class RemoteFailure(amount: MilliSatoshi, route: Seq[Hop], e: Sphinx.DecryptedFailurePacket) extends PaymentFailure
 
 /** A remote node failed the payment but we couldn't decrypt the failure (e.g. a malicious node tampered with the message). */
-case class UnreadableRemoteFailure(amount: MilliSatoshi, route: Seq[Hop]) extends PaymentFailure
+case class UnreadableRemoteFailure(amount: MilliSatoshi, route: Seq[Hop], failurePacket: ByteVector) extends PaymentFailure
 
 object PaymentFailure {
 
@@ -237,7 +235,7 @@ object PaymentFailure {
       }
     case RemoteFailure(_, hops, Sphinx.DecryptedFailurePacket(nodeId, _)) =>
       ignoreNodeOutgoingEdge(nodeId, hops, ignore)
-    case UnreadableRemoteFailure(_, hops) =>
+    case UnreadableRemoteFailure(_, hops, _) =>
       // We don't know which node is sending garbage, let's blacklist all nodes except:
       //  - the one we are directly connected to: it would be too restrictive for retries
       //  - the final recipient: they have no incentive to send garbage since they want that payment

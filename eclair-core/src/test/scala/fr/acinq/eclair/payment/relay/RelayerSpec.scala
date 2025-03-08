@@ -33,9 +33,9 @@ import fr.acinq.eclair.payment.IncomingPaymentPacket.FinalPacket
 import fr.acinq.eclair.payment.OutgoingPaymentPacket.{NodePayload, buildOnion, buildOutgoingPayment}
 import fr.acinq.eclair.payment.PaymentPacketSpec._
 import fr.acinq.eclair.payment.relay.Relayer._
-import fr.acinq.eclair.payment.send.{ClearRecipient, TrampolineRecipient}
+import fr.acinq.eclair.payment.send.{ClearRecipient, TrampolinePayment}
 import fr.acinq.eclair.router.BaseRouterSpec.{blindedRouteFromHops, channelHopFromUpdate}
-import fr.acinq.eclair.router.Router.{NodeHop, Route}
+import fr.acinq.eclair.router.Router.Route
 import fr.acinq.eclair.wire.protocol.PaymentOnion.FinalPayload
 import fr.acinq.eclair.wire.protocol._
 import org.scalatest.concurrent.PatienceConfiguration
@@ -81,8 +81,8 @@ class RelayerSpec extends ScalaTestWithActorTestKit(ConfigFactory.load("applicat
     assert(sender.expectMessageType[Relayer.OutgoingChannels].channels.isEmpty)
 
     // We publish a channel update, that should be picked up by the channel relayer
-    val shortIds_bc = ShortIds(RealScidStatus.Final(RealShortChannelId(channelUpdate_bc.shortChannelId.toLong)), ShortChannelId.generateLocalAlias(), remoteAlias_opt = None)
-    system.eventStream ! EventStream.Publish(LocalChannelUpdate(null, channelId_bc, shortIds_bc, c, None, channelUpdate_bc, makeCommitments(channelId_bc)))
+    val aliases_bc = ShortIdAliases(Alias(channelUpdate_bc.shortChannelId.toLong), remoteAlias_opt = None)
+    system.eventStream ! EventStream.Publish(LocalChannelUpdate(null, channelId_bc, aliases_bc, c, None, channelUpdate_bc, makeCommitments(channelId_bc)))
     eventually(PatienceConfiguration.Timeout(30 seconds), PatienceConfiguration.Interval(1 second)) {
       childActors.channelRelayer ! ChannelRelayer.GetOutgoingChannels(sender.ref.toClassic, GetOutgoingChannels())
       val channels = sender.expectMessageType[Relayer.OutgoingChannels].channels
@@ -161,12 +161,12 @@ class RelayerSpec extends ScalaTestWithActorTestKit(ConfigFactory.load("applicat
     val (_, blindedHop, recipient) = blindedRouteFromHops(finalAmount, finalExpiry, Seq(channelHopFromUpdate(b, c, channelUpdate_bc)), routeExpiry, paymentPreimage, hex"deadbeef")
     val route = Route(finalAmount, Seq(channelHopFromUpdate(priv_a.publicKey, b, channelUpdate_ab)), Some(blindedHop))
     val Right(payment) = buildOutgoingPayment(TestConstants.emptyOrigin, paymentHash, route, recipient, 1.0)
-    val add_ab = UpdateAddHtlc(channelId_ab, 0, payment.cmd.amount, payment.cmd.paymentHash, payment.cmd.cltvExpiry, payment.cmd.onion, payment.cmd.nextBlindingKey_opt, 1.0, payment.cmd.fundingFee_opt)
+    val add_ab = UpdateAddHtlc(channelId_ab, 0, payment.cmd.amount, payment.cmd.paymentHash, payment.cmd.cltvExpiry, payment.cmd.onion, payment.cmd.nextPathKey_opt, 1.0, payment.cmd.fundingFee_opt)
     relayer ! RelayForward(add_ab, priv_a.publicKey)
 
     val fail = register.expectMessageType[Register.Forward[CMD_FAIL_HTLC]].message
     assert(fail.id == add_ab.id)
-    assert(fail.reason == Right(InvalidOnionBlinding(Sphinx.hash(add_ab.onionRoutingPacket))))
+    assert(fail.reason == FailureReason.LocalFailure(InvalidOnionBlinding(Sphinx.hash(add_ab.onionRoutingPacket))))
     assert(fail.delay_opt.nonEmpty)
 
     register.expectNoMessage(50 millis)
@@ -177,7 +177,7 @@ class RelayerSpec extends ScalaTestWithActorTestKit(ConfigFactory.load("applicat
 
     // we use an expired blinded route.
     val Right(payment) = buildOutgoingBlindedPaymentAB(paymentHash, routeExpiry = CltvExpiry(nodeParams.currentBlockHeight - 1))
-    val add_ab = UpdateAddHtlc(channelId_ab, 0, payment.cmd.amount, payment.cmd.paymentHash, payment.cmd.cltvExpiry, payment.cmd.onion, payment.cmd.nextBlindingKey_opt, 1.0, payment.cmd.fundingFee_opt)
+    val add_ab = UpdateAddHtlc(channelId_ab, 0, payment.cmd.amount, payment.cmd.paymentHash, payment.cmd.cltvExpiry, payment.cmd.onion, payment.cmd.nextPathKey_opt, 1.0, payment.cmd.fundingFee_opt)
     relayer ! RelayForward(add_ab, priv_a.publicKey)
 
     val fail = register.expectMessageType[Register.Forward[CMD_FAIL_MALFORMED_HTLC]].message
@@ -193,18 +193,16 @@ class RelayerSpec extends ScalaTestWithActorTestKit(ConfigFactory.load("applicat
 
     // we use this to build a valid trampoline onion inside a normal onion
     val invoiceFeatures = Features[Bolt11Feature](VariableLengthOnion -> Mandatory, PaymentSecret -> Mandatory, BasicMultiPartPayment -> Optional, PaymentMetadata -> Optional, TrampolinePaymentPrototype -> Optional)
-    val invoice = Bolt11Invoice(Block.RegtestGenesisBlock.hash, None, paymentHash, priv_c.privateKey, Left("invoice"), CltvExpiryDelta(6), paymentSecret = paymentSecret, features = invoiceFeatures)
-    val trampolineHop = NodeHop(b, c, channelUpdate_bc.cltvExpiryDelta, fee_b)
-    val recipient = TrampolineRecipient(invoice, finalAmount, finalExpiry, trampolineHop, randomBytes32())
-    val Right(payment) = buildOutgoingPayment(TestConstants.emptyOrigin, paymentHash, Route(recipient.trampolineAmount, Seq(channelHopFromUpdate(priv_a.publicKey, b, channelUpdate_ab)), Some(trampolineHop)), recipient, 1.0)
+    val invoice = Bolt11Invoice(Block.RegtestGenesisBlock.hash, Some(finalAmount), paymentHash, priv_c.privateKey, Left("invoice"), CltvExpiryDelta(6), paymentSecret = paymentSecret, features = invoiceFeatures)
+    val payment = TrampolinePayment.buildOutgoingPayment(b, invoice, finalExpiry)
 
     // and then manually build an htlc
-    val add_ab = UpdateAddHtlc(channelId_ab, 123456, payment.cmd.amount, payment.cmd.paymentHash, payment.cmd.cltvExpiry, payment.cmd.onion, None, 1.0, None)
+    val add_ab = UpdateAddHtlc(channelId_ab, 123456, payment.trampolineAmount, invoice.paymentHash, payment.trampolineExpiry, payment.onion.packet, None, 1.0, None)
     relayer ! RelayForward(add_ab, priv_a.publicKey)
 
     val fail = register.expectMessageType[Register.Forward[CMD_FAIL_HTLC]].message
     assert(fail.id == add_ab.id)
-    assert(fail.reason == Right(RequiredNodeFeatureMissing()))
+    assert(fail.reason == FailureReason.LocalFailure(RequiredNodeFeatureMissing()))
 
     register.expectNoMessage(50 millis)
   }

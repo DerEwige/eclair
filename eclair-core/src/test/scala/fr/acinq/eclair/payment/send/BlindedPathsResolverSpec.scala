@@ -86,7 +86,7 @@ class BlindedPathsResolverSpec extends ScalaTestWithActorTestKit(ConfigFactory.l
     val probe = TestProbe()
     val introductionNodeId = randomKey().publicKey
     val scidDir = EncodedNodeId.ShortChannelIdDir(isNode1 = false, RealShortChannelId(BlockHeight(750_000), 3, 7))
-    val route = RouteBlinding.create(randomKey(), Seq(introductionNodeId), Seq(hex"deadbeef")).route.copy(introductionNodeId = scidDir)
+    val route = RouteBlinding.create(randomKey(), Seq(introductionNodeId), Seq(hex"deadbeef")).route.copy(firstNodeId = scidDir)
     val paymentInfo = PaymentInfo(100 msat, 250, CltvExpiryDelta(36), 1 msat, 50_000_000 msat, Features.empty)
     resolver ! Resolve(probe.ref, Seq(PaymentBlindedRoute(route, paymentInfo)))
     // We must resolve the scid_dir to a node_id.
@@ -99,8 +99,8 @@ class BlindedPathsResolverSpec extends ScalaTestWithActorTestKit(ConfigFactory.l
     assert(resolved.head.route.isInstanceOf[FullBlindedRoute])
     val fullRoute = resolved.head.route.asInstanceOf[FullBlindedRoute]
     assert(fullRoute.firstNodeId == introductionNodeId)
-    assert(fullRoute.firstBlinding == route.blindingKey)
-    assert(fullRoute.blindedNodes == route.blindedNodes)
+    assert(fullRoute.firstpathKey == route.firstPathKey)
+    assert(fullRoute.blindedHops == route.blindedHops)
     assert(resolved.head.paymentInfo == paymentInfo)
   }
 
@@ -114,12 +114,12 @@ class BlindedPathsResolverSpec extends ScalaTestWithActorTestKit(ConfigFactory.l
       ExtraEdge(nextNodeId, randomKey().publicKey, RealShortChannelId(BlockHeight(700_000), 1, 0), 750_000 msat, 150, CltvExpiryDelta(48), 1 msat, None),
     )
     val hops = edges.map(e => ChannelHop(e.shortChannelId, e.sourceNodeId, e.targetNodeId, HopRelayParams.FromHint(e)))
-    val route = BlindedRouteCreation.createBlindedRouteFromHops(hops, hex"deadbeef", 1 msat, CltvExpiry(800_000)).route
+    val route = BlindedRouteCreation.createBlindedRouteFromHops(hops, hops.last.nextNodeId, hex"deadbeef", 1 msat, CltvExpiry(800_000)).route
     val paymentInfo = BlindedRouteCreation.aggregatePaymentInfo(100_000_000 msat, hops, CltvExpiryDelta(12))
     Seq(true, false).foreach { useScidDir =>
       val toResolve = if (useScidDir) {
         val scidDir = EncodedNodeId.ShortChannelIdDir(isNode1 = true, edges.head.shortChannelId.asInstanceOf[RealShortChannelId])
-        route.copy(introductionNodeId = scidDir)
+        route.copy(firstNodeId = scidDir)
       } else {
         route
       }
@@ -142,8 +142,8 @@ class BlindedPathsResolverSpec extends ScalaTestWithActorTestKit(ConfigFactory.l
       assert(resolved.head.route.isInstanceOf[PartialBlindedRoute])
       val partialRoute = resolved.head.route.asInstanceOf[PartialBlindedRoute]
       assert(partialRoute.firstNodeId == nextNodeId)
-      assert(partialRoute.blindedNodes == route.subsequentNodes)
-      assert(partialRoute.nextBlinding != route.blindingKey)
+      assert(partialRoute.blindedHops == route.subsequentNodes)
+      assert(partialRoute.nextPathKey != route.firstPathKey)
       // The payment info for the partial route should be greater than the actual payment info.
       assert(750_000.msat <= resolved.head.paymentInfo.feeBase && resolved.head.paymentInfo.feeBase <= 1_000_000.msat)
       assert(150 <= resolved.head.paymentInfo.feeProportionalMillionths && resolved.head.paymentInfo.feeProportionalMillionths <= 200)
@@ -169,8 +169,8 @@ class BlindedPathsResolverSpec extends ScalaTestWithActorTestKit(ConfigFactory.l
     val partialRoute = resolved.head.route.asInstanceOf[PartialBlindedRoute]
     assert(partialRoute.firstNodeId == walletNodeId)
     assert(partialRoute.nextNodeId == EncodedNodeId.WithPublicKey.Wallet(walletNodeId))
-    assert(partialRoute.blindedNodes == route.subsequentNodes)
-    assert(partialRoute.nextBlinding != route.blindingKey)
+    assert(partialRoute.blindedHops == route.subsequentNodes)
+    assert(partialRoute.nextPathKey != route.firstPathKey)
     // We don't need to resolve the nodeId.
     register.expectNoMessage(100 millis)
     router.expectNoMessage(100 millis)
@@ -183,10 +183,10 @@ class BlindedPathsResolverSpec extends ScalaTestWithActorTestKit(ConfigFactory.l
     val scid = RealShortChannelId(BlockHeight(750_000), 3, 7)
     val edge = ExtraEdge(nodeParams.nodeId, randomKey().publicKey, scid, 600_000 msat, 100, CltvExpiryDelta(144), 1 msat, None)
     val hop = ChannelHop(edge.shortChannelId, edge.sourceNodeId, edge.targetNodeId, HopRelayParams.FromHint(edge))
-    val route = BlindedRouteCreation.createBlindedRouteFromHops(Seq(hop), hex"deadbeef", 1 msat, CltvExpiry(800_000)).route
+    val route = BlindedRouteCreation.createBlindedRouteFromHops(Seq(hop), edge.targetNodeId, hex"deadbeef", 1 msat, CltvExpiry(800_000)).route
     val paymentInfo = BlindedRouteCreation.aggregatePaymentInfo(50_000_000 msat, Seq(hop), CltvExpiryDelta(12))
     val toResolve = Seq(
-      PaymentBlindedRoute(route.copy(introductionNodeId = EncodedNodeId.ShortChannelIdDir(isNode1 = true, scid)), paymentInfo),
+      PaymentBlindedRoute(route.copy(firstNodeId = EncodedNodeId.ShortChannelIdDir(isNode1 = true, scid)), paymentInfo),
       PaymentBlindedRoute(route, paymentInfo),
       PaymentBlindedRoute(route, paymentInfo),
     )
@@ -211,15 +211,15 @@ class BlindedPathsResolverSpec extends ScalaTestWithActorTestKit(ConfigFactory.l
     val edgeLowExpiryDelta = ExtraEdge(nodeParams.nodeId, nextNodeId, scid, 600_000 msat, 100, CltvExpiryDelta(36), 1 msat, None)
     val toResolve = Seq(
       // We don't allow paying blinded routes to ourselves.
-      BlindedRouteCreation.createBlindedRouteWithoutHops(nodeParams.nodeId, hex"deadbeef", 1 msat, CltvExpiry(800_000)).route,
+      BlindedRouteCreation.createBlindedRouteFromHops(Nil, nodeParams.nodeId, hex"deadbeef", 1 msat, CltvExpiry(800_000)).route,
       // We reject blinded routes with low fees.
-      BlindedRouteCreation.createBlindedRouteFromHops(Seq(ChannelHop(scid, nodeParams.nodeId, edgeLowFees.targetNodeId, HopRelayParams.FromHint(edgeLowFees))), hex"deadbeef", 1 msat, CltvExpiry(800_000)).route,
+      BlindedRouteCreation.createBlindedRouteFromHops(Seq(ChannelHop(scid, nodeParams.nodeId, edgeLowFees.targetNodeId, HopRelayParams.FromHint(edgeLowFees))), edgeLowFees.targetNodeId, hex"deadbeef", 1 msat, CltvExpiry(800_000)).route,
       // We reject blinded routes with low cltv_expiry_delta.
-      BlindedRouteCreation.createBlindedRouteFromHops(Seq(ChannelHop(scid, nodeParams.nodeId, edgeLowExpiryDelta.targetNodeId, HopRelayParams.FromHint(edgeLowExpiryDelta))), hex"deadbeef", 1 msat, CltvExpiry(800_000)).route,
+      BlindedRouteCreation.createBlindedRouteFromHops(Seq(ChannelHop(scid, nodeParams.nodeId, edgeLowExpiryDelta.targetNodeId, HopRelayParams.FromHint(edgeLowExpiryDelta))), edgeLowExpiryDelta.targetNodeId, hex"deadbeef", 1 msat, CltvExpiry(800_000)).route,
       // We reject blinded routes with low fees, even when the next node seems to be a wallet node.
       BlindedRouteCreation.createBlindedRouteToWallet(ChannelHop(scid, nodeParams.nodeId, edgeLowFees.targetNodeId, HopRelayParams.FromHint(edgeLowFees)), hex"deadbeef", 1 msat, CltvExpiry(800_000)).route,
       // We reject blinded routes that cannot be decrypted.
-      BlindedRouteCreation.createBlindedRouteFromHops(Seq(ChannelHop(scid, nodeParams.nodeId, edgeLowFees.targetNodeId, HopRelayParams.FromHint(edgeLowFees))), hex"deadbeef", 1 msat, CltvExpiry(800_000)).route.copy(blindingKey = randomKey().publicKey)
+      BlindedRouteCreation.createBlindedRouteFromHops(Seq(ChannelHop(scid, nodeParams.nodeId, edgeLowFees.targetNodeId, HopRelayParams.FromHint(edgeLowFees))), edgeLowFees.targetNodeId, hex"deadbeef", 1 msat, CltvExpiry(800_000)).route.copy(firstPathKey = randomKey().publicKey)
     ).map(r => PaymentBlindedRoute(r, PaymentInfo(1_000_000 msat, 2500, CltvExpiryDelta(300), 1 msat, 500_000_000 msat, Features.empty)))
     resolver ! Resolve(probe.ref, toResolve)
     // The routes with low fees or expiry require resolving the next node.

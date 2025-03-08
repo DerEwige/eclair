@@ -4,45 +4,46 @@
 
 ## Major changes
 
-### Liquidity Ads
-
-This release includes an early prototype for [liquidity ads](https://github.com/lightning/bolts/pull/1153).
-Liquidity ads allow nodes to sell their liquidity in a trustless and decentralized manner.
-Every node advertizes the rates at which they sell their liquidity, and buyers connect to sellers that offer interesting rates.
-
-The liquidity ads specification is still under review and will likely change.
-This feature isn't meant to be used on mainnet yet and is thus disabled by default.
-
 ### Update minimal version of Bitcoin Core
 
-With this release, eclair requires using Bitcoin Core 27.1.
+With this release, eclair requires using Bitcoin Core 28.1.
 Newer versions of Bitcoin Core may be used, but have not been extensively tested.
 
-This version introduces a new coin selection algorithm called  [CoinGrinder](https://github.com/bitcoin/bitcoin/blob/master/doc/release-notes/release-notes-27.0.md#wallet) that will reduce on-chain transaction costs when feerates are high.
+### Simplified mutual close
 
-To enable CoinGrinder at all fee rates and prevent the automatic consolidation of UTXOs, add the following line to your `bitcoin.conf` file:
+This release includes support for the latest [mutual close protocol](https://github.com/lightning/bolts/pull/1205).
+This protocol allows both channel participants to decide exactly how much fees they're willing to pay to close the channel.
+Each participant obtains a channel closing transaction where they are paying the fees.
 
-```conf
-consolidatefeerate=0
+Once closing transactions are broadcast, they can be RBF-ed by calling the `close` RPC again with a higher feerate:
+
+```sh
+./eclair-cli close --channelId=<channel_id> --preferredFeerateSatByte=<rbf_feerate>
 ```
 
-### Incoming obsolete channels will be rejected
+### Peer storage
 
-Eclair will not allow remote peers to open new `static_remote_key` channels. These channels are obsolete, node operators should use `option_anchors` channels now.
-Existing `static_remote_key` channels will continue to work. You can override this behaviour by setting `eclair.channel.accept-incoming-static-remote-key-channels` to true.
+With this release, eclair supports the `option_provide_storage` feature introduced in <https://github.com/lightning/bolts/pull/1110>.
+When `option_provide_storage` is enabled, eclair will store a small encrypted backup for peers that request it.
+This backup is limited to 65kB and node operators should customize the `eclair.peer-storage` configuration section to match their desired SLAs.
+This is mostly intended for LSPs that serve mobile wallets to allow users to restore their channels when they switch phones.
 
-Eclair will not allow remote peers to open new obsolete channels that do not support `option_static_remotekey`.
+### Eclair requires a  Java 21 runtime
+
+Eclair now targets Java 21 and requires a compatible Java Runtime Environment. It will no longer work on JRE 11 or JRE 17.
+There are many organisations that package Java runtimes and development kits, for example [OpenJDK 21](https://adoptium.net/temurin/releases/?package=jdk&version=21).
 
 ### API changes
 
-- `channelstats` now takes optional parameters `--count` and `--skip` to control pagination. By default, it will return first 10 entries. (#2890)
-- `createinvoice` now takes an optional `--privateChannelIds` parameter that can be used to add routing hints through private channels. (#2909)
-- `nodes` allows filtering nodes that offer liquidity ads (#2848)
-- `rbfsplice` lets any channel participant RBF the current unconfirmed splice transaction (#2887)
+<insert changes>
 
 ### Miscellaneous improvements and bug fixes
 
-<insert changes>
+#### Gossip sync limits
+
+On reconnection, eclair now only synchronizes its routing table with a small number of top peers instead of synchronizing with every peer.
+If you already use `sync-whitelist`, the default behavior has been modified and you must set `router.sync.peer-limit = 0` to keep preventing any synchronization with other nodes.
+You must also use `router.sync.whitelist` instead of `sync-whitelist`.
 
 ## Verifying signatures
 
@@ -68,14 +69,13 @@ $ sha256sum -c SHA256SUMS.stripped
 
 Eclair builds are deterministic. To reproduce our builds, please use the following environment (*):
 
-- Ubuntu 22.04
-- AdoptOpenJDK 11.0.22
-- Maven 3.9.2
+- Ubuntu 24.04.1
+- Adoptium OpenJDK 21.0.4
 
 Use the following command to generate the eclair-node package:
 
 ```sh
-mvn clean install -DskipTests
+./mvnw clean install -DskipTests
 ```
 
 That should generate `eclair-node/target/eclair-node-<version>-XXXXXXX-bin.zip` with sha256 checksums that match the one we provide and sign in `SHA256SUMS.asc`
@@ -88,4 +88,4 @@ This release is fully compatible with previous eclair versions. You don't need t
 
 ## Changelog
 
-<fill this section when publishing the release with `git log v0.10.0... --format=oneline --reverse`>
+<fill this section when publishing the release with `git log v0.11.0... --format=oneline --reverse`>

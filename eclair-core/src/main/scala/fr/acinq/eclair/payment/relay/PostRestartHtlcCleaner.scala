@@ -28,7 +28,7 @@ import fr.acinq.eclair.db._
 import fr.acinq.eclair.payment.Monitoring.Tags
 import fr.acinq.eclair.payment.{ChannelPaymentRelayed, IncomingPaymentPacket, PaymentFailed, PaymentSent}
 import fr.acinq.eclair.transactions.DirectedHtlc.outgoing
-import fr.acinq.eclair.wire.protocol.{FailureMessage, InvalidOnionBlinding, TemporaryNodeFailure, UpdateAddHtlc}
+import fr.acinq.eclair.wire.protocol.{FailureMessage, FailureReason, InvalidOnionBlinding, TemporaryNodeFailure, UpdateAddHtlc}
 import fr.acinq.eclair.{CustomCommitmentsPlugin, Feature, Features, Logs, MilliSatoshiLong, NodeParams, TimestampMilli}
 
 import scala.concurrent.Promise
@@ -129,14 +129,14 @@ class PostRestartHtlcCleaner(nodeParams: NodeParams, register: ActorRef, initial
                 Metrics.Resolved.withTag(Tags.Success, value = false).withTag(Metrics.Relayed, value = false).increment()
                 if (e.currentState != CLOSING && e.currentState != CLOSED) {
                   log.info(s"failing not relayed htlc=$htlc")
-                  val cmd = htlc.blinding_opt match {
+                  val cmd = htlc.pathKey_opt match {
                     case Some(_) =>
-                      // The incoming HTLC contains a blinding point: we must be an intermediate node in a blinded path,
+                      // The incoming HTLC contains a path key: we must be an intermediate node in a blinded path,
                       // and we thus need to return an update_fail_malformed_htlc.
                       val failure = InvalidOnionBlinding(ByteVector32.Zeroes)
                       CMD_FAIL_MALFORMED_HTLC(htlc.id, failure.onionHash, failure.code, commit = true)
                     case None =>
-                      CMD_FAIL_HTLC(htlc.id, Right(TemporaryNodeFailure()), commit = true)
+                      CMD_FAIL_HTLC(htlc.id, FailureReason.LocalFailure(TemporaryNodeFailure()), commit = true)
                   }
                   channel ! cmd
                 } else {
@@ -261,7 +261,7 @@ class PostRestartHtlcCleaner(nodeParams: NodeParams, register: ActorRef, initial
               case Upstream.Cold.Channel(originChannelId, originHtlcId, _) =>
                 log.warning(s"payment failed for paymentHash=${failedHtlc.paymentHash}: failing 1 HTLC upstream")
                 Metrics.Resolved.withTag(Tags.Success, value = false).withTag(Metrics.Relayed, value = true).increment()
-                val cmd = failedHtlc.blinding_opt match {
+                val cmd = failedHtlc.pathKey_opt match {
                   case Some(_) =>
                     // If we are inside a blinded path, we cannot know whether we're the introduction node or not since
                     // we don't have access to the incoming onion: to avoid leaking information, we act as if we were an
@@ -278,7 +278,7 @@ class PostRestartHtlcCleaner(nodeParams: NodeParams, register: ActorRef, initial
                   Metrics.Resolved.withTag(Tags.Success, value = false).withTag(Metrics.Relayed, value = true).increment()
                   // We don't bother decrypting the downstream failure to forward a more meaningful error upstream, it's
                   // very likely that it won't be actionable anyway because of our node restart.
-                  PendingCommandsDb.safeSend(register, nodeParams.db.pendingCommands, channelId, CMD_FAIL_HTLC(htlcId, Right(TemporaryNodeFailure()), commit = true))
+                  PendingCommandsDb.safeSend(register, nodeParams.db.pendingCommands, channelId, CMD_FAIL_HTLC(htlcId, FailureReason.LocalFailure(TemporaryNodeFailure()), commit = true))
                 }
             }
           }
