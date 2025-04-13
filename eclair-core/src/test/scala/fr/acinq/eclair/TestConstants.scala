@@ -26,11 +26,12 @@ import fr.acinq.eclair.db.RevokedHtlcInfoCleaner
 import fr.acinq.eclair.io.MessageRelay.RelayAll
 import fr.acinq.eclair.io.{OpenChannelInterceptor, PeerConnection, PeerReadyNotifier}
 import fr.acinq.eclair.message.OnionMessages.OnionMessageConfig
+import fr.acinq.eclair.payment.offer.OffersConfig
 import fr.acinq.eclair.payment.relay.OnTheFlyFunding
 import fr.acinq.eclair.payment.relay.Relayer.{AsyncPaymentsParams, RelayFees, RelayParams}
 import fr.acinq.eclair.router.Graph.{MessageWeightRatios, PaymentWeightRatios}
-import fr.acinq.eclair.router.{PathFindingExperimentConf, Router}
 import fr.acinq.eclair.router.Router._
+import fr.acinq.eclair.router.{PathFindingExperimentConf, Router}
 import fr.acinq.eclair.wire.protocol._
 import org.scalatest.Tag
 import scodec.bits.{ByteVector, HexStringSyntax}
@@ -56,7 +57,7 @@ object TestConstants {
     paymentTypes = Set(LiquidityAds.PaymentType.FromChannelBalance)
   )
   val emptyOnionPacket: OnionRoutingPacket = OnionRoutingPacket(0, ByteVector.fill(33)(0), ByteVector.fill(1300)(0), ByteVector32.Zeroes)
-  val emptyOrigin = Origin.Hot(ActorRef.noSender, Upstream.Local(UUID.randomUUID()))
+  val emptyOrigin: Origin.Hot = Origin.Hot(ActorRef.noSender, Upstream.Local(UUID.randomUUID()))
 
   case object TestFeature extends Feature with InitFeature with NodeFeature {
     val rfcName = "test_feature"
@@ -109,6 +110,7 @@ object TestConstants {
           Features.Quiescence -> FeatureSupport.Optional,
           Features.SplicePrototype -> FeatureSupport.Optional,
           Features.ProvideStorage -> FeatureSupport.Optional,
+          Features.ChannelType -> FeatureSupport.Mandatory
         ),
         unknown = Set(UnknownFeature(TestFeature.optional))
       ),
@@ -246,7 +248,8 @@ object TestConstants {
       liquidityAdsConfig = LiquidityAds.Config(Some(defaultLiquidityRates), lockUtxos = true),
       peerWakeUpConfig = PeerReadyNotifier.WakeUpConfig(enabled = false, timeout = 30 seconds),
       onTheFlyFundingConfig = OnTheFlyFunding.Config(proposalTimeout = 90 seconds),
-      peerStorageConfig = PeerStorageConfig(writeDelay = 5 seconds, removalDelay = 10 seconds, cleanUpFrequency = 1 hour)
+      peerStorageConfig = PeerStorageConfig(writeDelay = 5 seconds, removalDelay = 10 seconds, cleanUpFrequency = 1 hour),
+      offersConfig = OffersConfig(messagePathMinLength = 2, paymentPathCount = 2, paymentPathLength = 4, paymentPathCltvExpiryDelta = CltvExpiryDelta(500)),
     )
 
     def channelParams: LocalParams = OpenChannelInterceptor.makeChannelParams(
@@ -293,6 +296,7 @@ object TestConstants {
         Features.AnchorOutputsZeroFeeHtlcTx -> FeatureSupport.Optional,
         Features.Quiescence -> FeatureSupport.Optional,
         Features.SplicePrototype -> FeatureSupport.Optional,
+        Features.ChannelType -> FeatureSupport.Mandatory
       ),
       pluginParams = Nil,
       overrideInitFeatures = Map.empty,
@@ -428,7 +432,8 @@ object TestConstants {
       liquidityAdsConfig = LiquidityAds.Config(Some(defaultLiquidityRates), lockUtxos = true),
       peerWakeUpConfig = PeerReadyNotifier.WakeUpConfig(enabled = false, timeout = 30 seconds),
       onTheFlyFundingConfig = OnTheFlyFunding.Config(proposalTimeout = 90 seconds),
-      peerStorageConfig = PeerStorageConfig(writeDelay = 5 seconds, removalDelay = 10 seconds, cleanUpFrequency = 1 hour)
+      peerStorageConfig = PeerStorageConfig(writeDelay = 5 seconds, removalDelay = 10 seconds, cleanUpFrequency = 1 hour),
+      offersConfig = OffersConfig(messagePathMinLength = 2, paymentPathCount = 2, paymentPathLength = 4, paymentPathCltvExpiryDelta = CltvExpiryDelta(500)),
     )
 
     def channelParams: LocalParams = OpenChannelInterceptor.makeChannelParams(

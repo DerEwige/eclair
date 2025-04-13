@@ -38,16 +38,6 @@ class HelpersSpec extends TestKitBaseClass with AnyFunSuiteLike with ChannelStat
 
   implicit val log: akka.event.LoggingAdapter = akka.event.NoLogging
 
-  test("scale funding tx min depth according to funding amount") {
-    assert(ChannelParams.minDepthScaled(defaultMinDepth = 3, Btc(1)) == 5)
-    assert(ChannelParams.minDepthScaled(defaultMinDepth = 6, Btc(1)) == 6) // 5 conf would be enough but we use min-depth=6
-    assert(ChannelParams.minDepthScaled(defaultMinDepth = 3, Btc(3.125)) == 11) // we use scaling_factor=10 and a fixed block reward of 3.125BTC
-    assert(ChannelParams.minDepthScaled(defaultMinDepth = 3, Btc(6.25)) == 21)
-    assert(ChannelParams.minDepthScaled(defaultMinDepth = 3, Btc(10)) == 33)
-    assert(ChannelParams.minDepthScaled(defaultMinDepth = 3, Btc(25)) == 81)
-    assert(ChannelParams.minDepthScaled(defaultMinDepth = 3, Btc(50)) == 161)
-  }
-
   test("compute refresh delay") {
     import org.scalatest.matchers.should.Matchers._
     implicit val log: akka.event.DiagnosticLoggingAdapter = NoLoggingDiagnostics
@@ -111,47 +101,6 @@ class HelpersSpec extends TestKitBaseClass with AnyFunSuiteLike with ChannelStat
     assert(claimHtlcSuccessTxs.length == 1)
 
     Fixture(alice, lcp, Set(htlca1a, htlca1b, htlca2), bob, rcp, Set(htlcb1a, htlcb1b, htlcb2), probe)
-  }
-
-  def identifyHtlcs(f: Fixture): Unit = {
-    import f._
-
-    val htlcTimeoutTxs = getHtlcTimeoutTxs(aliceCommitPublished)
-    val htlcSuccessTxs = getHtlcSuccessTxs(aliceCommitPublished)
-    val claimHtlcTimeoutTxs = getClaimHtlcTimeoutTxs(bobCommitPublished)
-    val claimHtlcSuccessTxs = getClaimHtlcSuccessTxs(bobCommitPublished)
-
-    // Valid txs should be detected:
-    htlcTimeoutTxs.foreach(tx => assert(Closing.isHtlcTimeout(tx.tx, aliceCommitPublished)))
-    htlcSuccessTxs.foreach(tx => assert(Closing.isHtlcSuccess(tx.tx, aliceCommitPublished)))
-    claimHtlcTimeoutTxs.foreach(tx => assert(Closing.isClaimHtlcTimeout(tx.tx, bobCommitPublished)))
-    claimHtlcSuccessTxs.foreach(tx => assert(Closing.isClaimHtlcSuccess(tx.tx, bobCommitPublished)))
-
-    // Invalid txs should be rejected:
-    htlcSuccessTxs.foreach(tx => assert(!Closing.isHtlcTimeout(tx.tx, aliceCommitPublished)))
-    claimHtlcTimeoutTxs.foreach(tx => assert(!Closing.isHtlcTimeout(tx.tx, aliceCommitPublished)))
-    claimHtlcSuccessTxs.foreach(tx => assert(!Closing.isHtlcTimeout(tx.tx, aliceCommitPublished)))
-    htlcTimeoutTxs.foreach(tx => assert(!Closing.isHtlcSuccess(tx.tx, aliceCommitPublished)))
-    claimHtlcTimeoutTxs.foreach(tx => assert(!Closing.isHtlcSuccess(tx.tx, aliceCommitPublished)))
-    claimHtlcSuccessTxs.foreach(tx => assert(!Closing.isHtlcSuccess(tx.tx, aliceCommitPublished)))
-    htlcTimeoutTxs.foreach(tx => assert(!Closing.isClaimHtlcTimeout(tx.tx, bobCommitPublished)))
-    htlcSuccessTxs.foreach(tx => assert(!Closing.isClaimHtlcTimeout(tx.tx, bobCommitPublished)))
-    claimHtlcSuccessTxs.foreach(tx => assert(!Closing.isClaimHtlcTimeout(tx.tx, bobCommitPublished)))
-    htlcTimeoutTxs.foreach(tx => assert(!Closing.isClaimHtlcSuccess(tx.tx, bobCommitPublished)))
-    htlcSuccessTxs.foreach(tx => assert(!Closing.isClaimHtlcSuccess(tx.tx, bobCommitPublished)))
-    claimHtlcTimeoutTxs.foreach(tx => assert(!Closing.isClaimHtlcSuccess(tx.tx, bobCommitPublished)))
-  }
-
-  test("identify htlc txs") {
-    identifyHtlcs(setupHtlcs())
-  }
-
-  test("identify htlc txs (anchor outputs)", Tag(ChannelStateTestsTags.AnchorOutputs)) {
-    identifyHtlcs(setupHtlcs(Set(ChannelStateTestsTags.AnchorOutputs)))
-  }
-
-  test("identify htlc txs (anchor outputs zero fee htlc txs)", Tag(ChannelStateTestsTags.AnchorOutputsZeroFeeHtlcTxs)) {
-    identifyHtlcs(setupHtlcs(Set(ChannelStateTestsTags.AnchorOutputsZeroFeeHtlcTxs)))
   }
 
   def findTimedOutHtlcs(f: Fixture): Unit = {

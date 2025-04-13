@@ -4,58 +4,52 @@
 
 ## Major changes
 
-### Update minimal version of Bitcoin Core
+<insert changes>
 
-With this release, eclair requires using Bitcoin Core 28.1.
-Newer versions of Bitcoin Core may be used, but have not been extensively tested.
+### Package relay
 
-### Simplified mutual close
+With Bitcoin Core 28.1, eclair starts relying on the `submitpackage` RPC during channel force-close.
+When using anchor outputs, allows propagating our local commitment transaction to peers who are also running Bitcoin Core 28.x or newer, even if the commitment feerate is low (package relay).
 
-This release includes support for the latest [mutual close protocol](https://github.com/lightning/bolts/pull/1205).
-This protocol allows both channel participants to decide exactly how much fees they're willing to pay to close the channel.
-Each participant obtains a channel closing transaction where they are paying the fees.
-
-Once closing transactions are broadcast, they can be RBF-ed by calling the `close` RPC again with a higher feerate:
-
-```sh
-./eclair-cli close --channelId=<channel_id> --preferredFeerateSatByte=<rbf_feerate>
-```
-
-### Peer storage
-
-With this release, eclair supports the `option_provide_storage` feature introduced in <https://github.com/lightning/bolts/pull/1110>.
-When `option_provide_storage` is enabled, eclair will store a small encrypted backup for peers that request it.
-This backup is limited to 65kB and node operators should customize the `eclair.peer-storage` configuration section to match their desired SLAs.
-This is mostly intended for LSPs that serve mobile wallets to allow users to restore their channels when they switch phones.
-
-### Eclair requires a  Java 21 runtime
-
-Eclair now targets Java 21 and requires a compatible Java Runtime Environment. It will no longer work on JRE 11 or JRE 17.
-There are many organisations that package Java runtimes and development kits, for example [OpenJDK 21](https://adoptium.net/temurin/releases/?package=jdk&version=21).
+This removes the need for increasing the commitment feerate based on mempool conditions, which ensures that channels won't be force-closed anymore when nodes disagree on the current feerate.
 
 ### API changes
 
-<insert changes>
+- `listoffers` now returns more details about each offer.
+
+
+### Configuration changes
+
+- The default for `eclair.features.option_channel_type` is now  `mandatory` instead of `optional`. This change prepares nodes to always assume the behavior of `option_channel_type` from peers when Bolts PR [#1232](https://github.com/lightning/bolts/pull/1232) is adopted. Until [#1232](https://github.com/lightning/bolts/pull/1232) is adopted you can still set `option_channel_type` to `optional` in your `eclair.conf` file for specific peers that do not yet support this option, see `Configure.md` for more information.
 
 ### Miscellaneous improvements and bug fixes
 
-#### Gossip sync limits
+#### Remove confirmation scaling based on funding amount
 
-On reconnection, eclair now only synchronizes its routing table with a small number of top peers instead of synchronizing with every peer.
-If you already use `sync-whitelist`, the default behavior has been modified and you must set `router.sync.peer-limit = 0` to keep preventing any synchronization with other nodes.
-You must also use `router.sync.whitelist` instead of `sync-whitelist`.
+We previously scaled the number of confirmations based on the channel funding amount.
+However, this doesn't work with splicing, where the channel capacity may change drastically.
+It's much simpler to always use the same number of confirmations, while choosing a value that is large enough to protect against malicious reorgs.
+We now by default use 8 confirmations, which can be modified in `eclair.conf`:
+
+```conf
+// Minimum number of confirmations for channel transactions to be safe from reorgs.
+eclair.channel.min-depth-blocks = 8
+```
+
+Note however that we require `min-depth` to be at least 6 blocks, since the BOLTs require this before announcing channels.
+See #3044 for more details.
 
 ## Verifying signatures
 
-You will need `gpg` and our release signing key 7A73FE77DE2C4027. Note that you can get it:
+You will need `gpg` and our release signing key E04E48E72C205463. Note that you can get it:
 
-- from our website: https://acinq.co/pgp/drouinf.asc
+- from our website: https://acinq.co/pgp/drouinf2.asc
 - from github user @sstone, a committer on eclair: https://api.github.com/users/sstone/gpg_keys
 
 To import our signing key:
 
 ```sh
-$ gpg --import drouinf.asc
+$ gpg --import drouinf2.asc
 ```
 
 To verify the release file checksums and signatures:
@@ -70,7 +64,7 @@ $ sha256sum -c SHA256SUMS.stripped
 Eclair builds are deterministic. To reproduce our builds, please use the following environment (*):
 
 - Ubuntu 24.04.1
-- Adoptium OpenJDK 21.0.4
+- Adoptium OpenJDK 21.0.6
 
 Use the following command to generate the eclair-node package:
 
@@ -80,7 +74,7 @@ Use the following command to generate the eclair-node package:
 
 That should generate `eclair-node/target/eclair-node-<version>-XXXXXXX-bin.zip` with sha256 checksums that match the one we provide and sign in `SHA256SUMS.asc`
 
-(*) You may be able to build the exact same artefacts with other operating systems or versions of JDK 11, we have not tried everything.
+(*) You may be able to build the exact same artefacts with other operating systems or versions of JDK 21, we have not tried everything.
 
 ## Upgrading
 
@@ -88,4 +82,4 @@ This release is fully compatible with previous eclair versions. You don't need t
 
 ## Changelog
 
-<fill this section when publishing the release with `git log v0.11.0... --format=oneline --reverse`>
+<fill this section when publishing the release with `git log v0.12.0... --format=oneline --reverse`>

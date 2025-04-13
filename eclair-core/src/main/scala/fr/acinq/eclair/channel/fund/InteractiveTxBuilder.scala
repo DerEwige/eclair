@@ -105,16 +105,15 @@ object InteractiveTxBuilder {
     // @formatter:off
     def info: InputInfo
     def weight: Int
-    def sign(keyManager: ChannelKeyManager, params: ChannelParams, tx: Transaction): ByteVector64
     // @formatter:on
   }
 
   case class Multisig2of2Input(info: InputInfo, fundingTxIndex: Long, remoteFundingPubkey: PublicKey) extends SharedFundingInput {
     override val weight: Int = 388
 
-    override def sign(keyManager: ChannelKeyManager, params: ChannelParams, tx: Transaction): ByteVector64 = {
+    def sign(keyManager: ChannelKeyManager, params: ChannelParams, tx: Transaction, spentUtxos: Map[OutPoint, TxOut]): ByteVector64 = {
       val localFundingPubkey = keyManager.fundingPublicKey(params.localParams.fundingKeyPath, fundingTxIndex)
-      keyManager.sign(Transactions.SpliceTx(info, tx), localFundingPubkey, TxOwner.Local, params.commitmentFormat)
+      keyManager.sign(Transactions.SpliceTx(info, tx), localFundingPubkey, TxOwner.Local, params.commitmentFormat, spentUtxos)
     }
   }
 
@@ -337,6 +336,8 @@ object InteractiveTxBuilder {
     val remoteFees: MilliSatoshi = remoteAmountIn - remoteAmountOut
     // Note that the truncation is a no-op: sub-satoshi balances are carried over from inputs to outputs and cancel out.
     val fees: Satoshi = (localFees + remoteFees).truncateToSatoshi
+    // When signing transactions that include taproot inputs, we must provide details about all of the transaction's inputs.
+    val inputDetails: Map[OutPoint, TxOut] = (sharedInput_opt.toSeq.map(i => i.outPoint -> i.txOut) ++ localInputs.map(i => i.outPoint -> i.txOut) ++ remoteInputs.map(i => i.outPoint -> i.txOut)).toMap
 
     def localOnlyNonChangeOutputs: List[Output.Local.NonChange] = localOutputs.collect { case o: Local.NonChange => o }
 
@@ -847,9 +848,9 @@ private class InteractiveTxBuilder(replyTo: ActorRef[InteractiveTxBuilder.Respon
       case Right((localSpec, localCommitTx, remoteSpec, remoteCommitTx, sortedHtlcTxs)) =>
         require(fundingTx.txOut(fundingOutputIndex).publicKeyScript == localCommitTx.input.txOut.publicKeyScript, "pubkey script mismatch!")
         val fundingPubKey = keyManager.fundingPublicKey(channelParams.localParams.fundingKeyPath, purpose.fundingTxIndex)
-        val localSigOfRemoteTx = keyManager.sign(remoteCommitTx, fundingPubKey, TxOwner.Remote, channelParams.channelFeatures.commitmentFormat)
+        val localSigOfRemoteTx = keyManager.sign(remoteCommitTx, fundingPubKey, TxOwner.Remote, channelParams.channelFeatures.commitmentFormat, Map.empty)
         val localPerCommitmentPoint = keyManager.htlcPoint(keyManager.keyPath(channelParams.localParams, channelParams.channelConfig))
-        val htlcSignatures = sortedHtlcTxs.map(keyManager.sign(_, localPerCommitmentPoint, purpose.remotePerCommitmentPoint, TxOwner.Remote, channelParams.commitmentFormat)).toList
+        val htlcSignatures = sortedHtlcTxs.map(keyManager.sign(_, localPerCommitmentPoint, purpose.remotePerCommitmentPoint, TxOwner.Remote, channelParams.commitmentFormat, Map.empty)).toList
         val localCommitSig = CommitSig(fundingParams.channelId, localSigOfRemoteTx, htlcSignatures)
         val localCommit = UnsignedLocalCommit(purpose.localCommitIndex, localSpec, localCommitTx, htlcTxs = Nil)
         val remoteCommit = RemoteCommit(purpose.remoteCommitIndex, remoteSpec, remoteCommitTx.tx.txid, purpose.remotePerCommitmentPoint)
@@ -912,10 +913,14 @@ private class InteractiveTxBuilder(replyTo: ActorRef[InteractiveTxBuilder.Respon
     import fr.acinq.bitcoin.scalacompat.KotlinUtils._
 
     val tx = unsignedTx.buildUnsignedTx()
-    val sharedSig_opt = fundingParams.sharedInput_opt.map(_.sign(keyManager, channelParams, tx))
+    val sharedSig_opt = fundingParams.sharedInput_opt.collect {
+      case i: Multisig2of2Input => i.sign(keyManager, channelParams, tx, unsignedTx.inputDetails)
+    }
     if (unsignedTx.localInputs.isEmpty) {
       context.self ! SignTransactionResult(PartiallySignedSharedTransaction(unsignedTx, TxSignatures(fundingParams.channelId, tx, Nil, sharedSig_opt)))
     } else {
+      // We track our wallet inputs and outputs, so we can verify them when we sign the transaction: if Eclair is managing bitcoin core wallet keys, it will
+      // only sign our wallet inputs, and check that it can re-compute private keys for our wallet outputs.
       val ourWalletInputs = unsignedTx.localInputs.map(i => tx.txIn.indexWhere(_.outPoint == i.outPoint))
       val ourWalletOutputs = unsignedTx.localOutputs.flatMap {
         case Output.Local.Change(_, amount, pubkeyScript) => Some(tx.txOut.indexWhere(output => output.amount == amount && output.publicKeyScript == pubkeyScript))
@@ -924,9 +929,12 @@ private class InteractiveTxBuilder(replyTo: ActorRef[InteractiveTxBuilder.Respon
         // We trust that non-change outputs are valid: this only works if the entry point for creating such outputs is trusted (for example, a secure API call).
         case _: Output.Local.NonChange => None
       }
-      // We track our wallet inputs and outputs, so we can verify them when we sign the transaction: if Eclair is managing bitcoin core wallet keys, it will
-      // only sign our wallet inputs, and check that it can re-compute private keys for our wallet outputs
-      context.pipeToSelf(wallet.signPsbt(new Psbt(tx), ourWalletInputs, ourWalletOutputs).map {
+      // If this is a splice, the PSBT we create must contain the shared input, because if we use taproot wallet inputs
+      // we need information about *all* of the transaction's inputs, not just the one we're signing.
+      val psbt = unsignedTx.sharedInput_opt.flatMap {
+        si => new Psbt(tx).updateWitnessInput(si.outPoint, si.txOut, null, null, null, java.util.Map.of(), null, null, java.util.Map.of()).toOption
+      }.getOrElse(new Psbt(tx))
+      context.pipeToSelf(wallet.signPsbt(psbt, ourWalletInputs, ourWalletOutputs).map {
         response =>
           val localOutpoints = unsignedTx.localInputs.map(_.outPoint).toSet
           val partiallySignedTx = response.partiallySignedTx
@@ -1082,6 +1090,11 @@ object InteractiveTxSigningSession {
                             liquidityPurchase_opt: Option[LiquidityAds.PurchaseBasicInfo]) extends InteractiveTxSigningSession {
     val commitInput: InputInfo = localCommit.fold(_.commitTx.input, _.commitTxAndRemoteSig.commitTx.input)
     val localCommitIndex: Long = localCommit.fold(_.index, _.index)
+    // This value tells our peer whether we need them to retransmit their commit_sig on reconnection or not.
+    val nextLocalCommitmentNumber: Long = localCommit match {
+      case Left(unsignedCommit) => unsignedCommit.index
+      case Right(commit) => commit.index + 1
+    }
 
     def receiveCommitSig(nodeParams: NodeParams, channelParams: ChannelParams, remoteCommitSig: CommitSig)(implicit log: LoggingAdapter): Either[ChannelException, InteractiveTxSigningSession] = {
       localCommit match {

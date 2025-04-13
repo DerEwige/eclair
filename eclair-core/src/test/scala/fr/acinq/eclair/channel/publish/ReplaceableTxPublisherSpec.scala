@@ -22,14 +22,14 @@ import akka.pattern.pipe
 import akka.testkit.{TestFSMRef, TestProbe}
 import com.softwaremill.quicklens.ModifyPimp
 import fr.acinq.bitcoin.scalacompat.Crypto.PublicKey
-import fr.acinq.bitcoin.scalacompat.{Block, BtcAmount, MilliBtcDouble, MnemonicCode, OutPoint, SatoshiLong, Transaction, TxId}
+import fr.acinq.bitcoin.scalacompat.{Block, BtcAmount, MilliBtcDouble, MnemonicCode, OutPoint, SatoshiLong, ScriptElt, Transaction, TxId}
 import fr.acinq.eclair.NotificationsLogger.NotifyNodeOperator
 import fr.acinq.eclair.blockchain.bitcoind.BitcoindService
 import fr.acinq.eclair.blockchain.bitcoind.ZmqWatcher._
 import fr.acinq.eclair.blockchain.bitcoind.rpc.BitcoinCoreClient.MempoolTx
 import fr.acinq.eclair.blockchain.bitcoind.rpc.{BasicBitcoinJsonRPCClient, BitcoinCoreClient, BitcoinJsonRPCClient}
 import fr.acinq.eclair.blockchain.fee.{ConfirmationTarget, FeeratePerKw, FeeratesPerKw}
-import fr.acinq.eclair.blockchain.{CurrentBlockHeight, OnchainPubkeyCache}
+import fr.acinq.eclair.blockchain.{CurrentBlockHeight, OnChainPubkeyCache}
 import fr.acinq.eclair.channel._
 import fr.acinq.eclair.channel.fsm.Channel
 import fr.acinq.eclair.channel.publish.ReplaceableTxPublisher.{Publish, Stop, UpdateConfirmationTarget}
@@ -124,13 +124,19 @@ class ReplaceableTxPublisherSpec extends TestKitBaseClass with AnyFunSuiteLike w
   def createTestWallet(walletName: String) = {
     val walletRpcClient = createWallet(walletName)
     val probe = TestProbe()
-    val walletClient = new BitcoinCoreClient(walletRpcClient) with OnchainPubkeyCache {
+    val walletClient = new BitcoinCoreClient(walletRpcClient) with OnChainPubkeyCache {
       val pubkey = {
         getP2wpkhPubkey().pipeTo(probe.ref)
         probe.expectMsgType[PublicKey]
       }
+      val pubkeyScript = {
+        getReceivePublicKeyScript(None).pipeTo(probe.ref)
+        probe.expectMsgType[Seq[ScriptElt]]
+      }
 
       override def getP2wpkhPubkey(renew: Boolean): PublicKey = pubkey
+
+      override def getReceivePublicKeyScript(renew: Boolean): Seq[ScriptElt] = pubkeyScript
     }
 
     (walletRpcClient, walletClient)
@@ -413,9 +419,16 @@ class ReplaceableTxPublisherSpec extends TestKitBaseClass with AnyFunSuiteLike w
       // NB: we try to get transactions confirmed *before* their confirmation target, so we aim for a more aggressive block target what's provided.
       setFeerate(targetFeerate, blockTarget = 12)
       publisher ! Publish(probe.ref, anchorTx)
+
       // wait for the commit tx and anchor tx to be published
       val mempoolTxs = getMempoolTxs(2)
       assert(mempoolTxs.map(_.txid).contains(commitTx.tx.txid))
+
+      // we check that the anchor tx contains additional wallet inputs
+      // there are 2 transactions in the mempool, the one that is not the commit tx has to be the anchor tx
+      wallet.getTransaction(mempoolTxs.filterNot(_.txid == commitTx.tx.txid).head.txid).pipeTo(probe.ref)
+      val publishedAnchorTx = probe.expectMsgType[Transaction]
+      assert(publishedAnchorTx.txIn.size > 1)
 
       val targetFee = Transactions.weight2fee(targetFeerate, mempoolTxs.map(_.weight).sum.toInt)
       val actualFee = mempoolTxs.map(_.fees).sum
@@ -495,7 +508,7 @@ class ReplaceableTxPublisherSpec extends TestKitBaseClass with AnyFunSuiteLike w
       probe.expectMsg(commitTx.tx.txid)
       assert(getMempool().length == 1)
 
-      val maxFeerate = ReplaceableTxFunder.maxFeerate(anchorTx.txInfo, anchorTx.commitment, alice.underlyingActor.nodeParams.currentBitcoinCoreFeerates, alice.underlyingActor.nodeParams.onChainFeeConf)
+      val maxFeerate = ReplaceableTxFunder.maxFeerate(anchorTx.txInfo, anchorTx.commitment, anchorTx.commitTx, alice.underlyingActor.nodeParams.currentBitcoinCoreFeerates, alice.underlyingActor.nodeParams.onChainFeeConf)
       val targetFeerate = FeeratePerKw(50_000 sat)
       assert(maxFeerate <= targetFeerate / 2)
       setFeerate(targetFeerate, blockTarget = 12)
@@ -1201,12 +1214,12 @@ class ReplaceableTxPublisherSpec extends TestKitBaseClass with AnyFunSuiteLike w
       val (commitTx, htlcSuccess, htlcTimeout) = closeChannelWithHtlcs(f, aliceBlockHeight() + 30, outgoingHtlcAmount = 5_000_000 msat, incomingHtlcAmount = 4_000_000 msat)
       setFeerate(targetFeerate, blockTarget = 12)
       assert(htlcSuccess.txInfo.fee == 0.sat)
-      val htlcSuccessMaxFeerate = ReplaceableTxFunder.maxFeerate(htlcSuccess.txInfo, htlcSuccess.commitment, alice.underlyingActor.nodeParams.currentBitcoinCoreFeerates, alice.underlyingActor.nodeParams.onChainFeeConf)
+      val htlcSuccessMaxFeerate = ReplaceableTxFunder.maxFeerate(htlcSuccess.txInfo, htlcSuccess.commitment, htlcSuccess.commitTx, alice.underlyingActor.nodeParams.currentBitcoinCoreFeerates, alice.underlyingActor.nodeParams.onChainFeeConf)
       assert(htlcSuccessMaxFeerate < targetFeerate / 2)
       val htlcSuccessTx = testPublishHtlcSuccess(f, commitTx, htlcSuccess, htlcSuccessMaxFeerate)
       assert(htlcSuccessTx.txIn.length > 1)
       assert(htlcTimeout.txInfo.fee == 0.sat)
-      val htlcTimeoutMaxFeerate = ReplaceableTxFunder.maxFeerate(htlcTimeout.txInfo, htlcTimeout.commitment, alice.underlyingActor.nodeParams.currentBitcoinCoreFeerates, alice.underlyingActor.nodeParams.onChainFeeConf)
+      val htlcTimeoutMaxFeerate = ReplaceableTxFunder.maxFeerate(htlcTimeout.txInfo, htlcTimeout.commitment, htlcTimeout.commitTx, alice.underlyingActor.nodeParams.currentBitcoinCoreFeerates, alice.underlyingActor.nodeParams.onChainFeeConf)
       assert(htlcTimeoutMaxFeerate < targetFeerate / 2)
       val htlcTimeoutTx = testPublishHtlcTimeout(f, commitTx, htlcTimeout, htlcTimeoutMaxFeerate)
       assert(htlcTimeoutTx.txIn.length > 1)
@@ -1854,14 +1867,20 @@ class ReplaceableTxPublisherWithEclairSignerSpec extends ReplaceableTxPublisherS
     val entropy = ByteVector.fromValidHex("01" * 32)
     val seed = MnemonicCode.toSeed(MnemonicCode.toMnemonics(entropy), walletName)
     val keyManager = new LocalOnChainKeyManager(walletName, seed, TimestampSecond.now(), Block.RegtestGenesisBlock.hash)
-    val walletRpcClient = new BasicBitcoinJsonRPCClient(rpcAuthMethod = bitcoinrpcauthmethod, host = "localhost", port = bitcoindRpcPort, wallet = Some(walletName))
-    val walletClient = new BitcoinCoreClient(walletRpcClient, onChainKeyManager_opt = Some(keyManager)) with OnchainPubkeyCache {
+    val walletRpcClient = new BasicBitcoinJsonRPCClient(Block.RegtestGenesisBlock.hash, rpcAuthMethod = bitcoinrpcauthmethod, host = "localhost", port = bitcoindRpcPort, wallet = Some(walletName))
+    val walletClient = new BitcoinCoreClient(walletRpcClient, onChainKeyManager_opt = Some(keyManager)) with OnChainPubkeyCache {
       lazy val pubkey = {
         getP2wpkhPubkey().pipeTo(probe.ref)
         probe.expectMsgType[PublicKey]
       }
+      lazy val pubkeyScript = {
+        getReceivePublicKeyScript(None).pipeTo(probe.ref)
+        probe.expectMsgType[Seq[ScriptElt]]
+      }
 
       override def getP2wpkhPubkey(renew: Boolean): PublicKey = pubkey
+
+      override def getReceivePublicKeyScript(renew: Boolean): Seq[ScriptElt] = pubkeyScript
     }
     createEclairBackedWallet(walletRpcClient, keyManager)
 

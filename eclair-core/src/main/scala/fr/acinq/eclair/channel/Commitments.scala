@@ -7,9 +7,7 @@ import fr.acinq.bitcoin.scalacompat.{ByteVector32, ByteVector64, Crypto, Satoshi
 import fr.acinq.eclair.blockchain.fee.{FeeratePerByte, FeeratePerKw, FeeratesPerKw, OnChainFeeConf}
 import fr.acinq.eclair.channel.Helpers.Closing
 import fr.acinq.eclair.channel.Monitoring.{Metrics, Tags}
-import fr.acinq.eclair.channel.fsm.Channel
 import fr.acinq.eclair.channel.fsm.Channel.ChannelConf
-import fr.acinq.eclair.channel.fund.InteractiveTxBuilder.SharedTransaction
 import fr.acinq.eclair.crypto.keymanager.ChannelKeyManager
 import fr.acinq.eclair.crypto.{Generators, ShaChain}
 import fr.acinq.eclair.payment.OutgoingPaymentPacket
@@ -40,6 +38,9 @@ case class ChannelParams(channelId: ByteVector32,
   // We can safely cast to millisatoshis since we verify that it's less than a valid millisatoshi amount.
   val maxHtlcAmount: MilliSatoshi = remoteParams.maxHtlcValueInFlightMsat.toBigInt.min(localParams.maxHtlcValueInFlightMsat.toLong).toLong.msat
 
+  // If we've set the 0-conf feature bit for this peer, we will always use 0-conf with them.
+  val zeroConf: Boolean = localParams.initFeatures.hasFeature(Features.ZeroConf)
+
   /**
    * We update local/global features at reconnection
    */
@@ -49,47 +50,10 @@ case class ChannelParams(channelId: ByteVector32,
   )
 
   /**
-   * Returns the number of confirmations needed to safely handle a funding transaction that we unilaterally funded.
-   * As funder we trust ourselves to not double spend funding txs, so we don't need to scale the number of confirmations
-   * based on the funding amount. We want to wait a few blocks though to ensure that the short_channel_id we obtain will
-   * not be invalidated by a reorg.
+   * Returns the number of confirmations needed to make a channel transaction safe from reorgs.
+   * A malicious miner that can create a longer reorg will be able to steal all of the channel funds.
    */
-  def minDepthFunder(defaultMinDepth: Int): Option[Long] = {
-    if (localParams.initFeatures.hasFeature(Features.ZeroConf)) {
-      None
-    } else {
-      Some(defaultMinDepth.toLong)
-    }
-  }
-
-  /**
-   * Returns the number of confirmations needed to safely handle a funding transaction with remote inputs. We make sure
-   * the cumulative block reward largely exceeds the channel size, because an attacker that could create a reorg would
-   * be able to steal the entire channel funding, but would likely miss block rewards during that process, making it
-   * economically irrational for them.
-   *
-   * @param fundingAmount funding amount of the channel
-   * @return number of confirmations needed, if any
-   */
-  def minDepthFundee(defaultMinDepth: Int, fundingAmount: Satoshi): Option[Long] =
-    if (localParams.initFeatures.hasFeature(Features.ZeroConf)) {
-      None // zero-conf stay zero-conf, whatever the funding amount is
-    } else {
-      Some(ChannelParams.minDepthScaled(defaultMinDepth, fundingAmount))
-    }
-
-  /**
-   * When using dual funding or splices, we wait for multiple confirmations even if we're the initiator because:
-   *  - our peer may also contribute to the funding transaction, even if they don't contribute to the channel funding amount
-   *  - even if they don't, we may RBF the transaction and don't want to handle reorgs
-   */
-  def minDepthDualFunding(defaultMinDepth: Int, sharedTx: SharedTransaction): Option[Long] = {
-    if (localParams.initFeatures.hasFeature(Features.ZeroConf)) {
-      None
-    } else {
-      Some(ChannelParams.minDepthScaled(defaultMinDepth, sharedTx.sharedOutput.amount))
-    }
-  }
+  def minDepth(defaultMinDepth: Int): Option[Int] = if (zeroConf) None else Some(defaultMinDepth)
 
   /** Channel reserve that applies to our funds. */
   def localChannelReserveForCapacity(capacity: Satoshi, isSplice: Boolean): Satoshi = if (channelFeatures.hasFeature(Features.DualFunding) || isSplice) {
@@ -137,20 +101,6 @@ case class ChannelParams(channelId: ByteVector32,
     else Right(remoteScriptPubKey)
   }
 
-}
-
-object ChannelParams {
-  def minDepthScaled(defaultMinDepth: Int, amount: Satoshi): Int = {
-    if (amount <= Channel.MAX_FUNDING_WITHOUT_WUMBO) {
-      // small amount: not scaled
-      defaultMinDepth
-    } else {
-      val blockReward = 3.125 // this will be too large after the halving in 2028
-      val scalingFactor = 10
-      val blocksToReachFunding = (((scalingFactor * amount.toBtc.toDouble) / blockReward).ceil + 1).toInt
-      defaultMinDepth.max(blocksToReachFunding)
-    }
-  }
 }
 
 // @formatter:off
@@ -268,10 +218,10 @@ object LocalCommit {
 case class RemoteCommit(index: Long, spec: CommitmentSpec, txid: TxId, remotePerCommitmentPoint: PublicKey) {
   def sign(keyManager: ChannelKeyManager, params: ChannelParams, fundingTxIndex: Long, remoteFundingPubKey: PublicKey, commitInput: InputInfo): CommitSig = {
     val (remoteCommitTx, htlcTxs) = Commitment.makeRemoteTxs(keyManager, params.channelConfig, params.channelFeatures, index, params.localParams, params.remoteParams, fundingTxIndex, remoteFundingPubKey, commitInput, remotePerCommitmentPoint, spec)
-    val sig = keyManager.sign(remoteCommitTx, keyManager.fundingPublicKey(params.localParams.fundingKeyPath, fundingTxIndex), TxOwner.Remote, params.commitmentFormat)
+    val sig = keyManager.sign(remoteCommitTx, keyManager.fundingPublicKey(params.localParams.fundingKeyPath, fundingTxIndex), TxOwner.Remote, params.commitmentFormat, Map.empty)
     val channelKeyPath = keyManager.keyPath(params.localParams, params.channelConfig)
     val sortedHtlcTxs = htlcTxs.sortBy(_.input.outPoint.index)
-    val htlcSigs = sortedHtlcTxs.map(keyManager.sign(_, keyManager.htlcPoint(channelKeyPath), remotePerCommitmentPoint, TxOwner.Remote, params.commitmentFormat))
+    val htlcSigs = sortedHtlcTxs.map(keyManager.sign(_, keyManager.htlcPoint(channelKeyPath), remotePerCommitmentPoint, TxOwner.Remote, params.commitmentFormat, Map.empty))
     CommitSig(params.channelId, sig, htlcSigs.toList)
   }
 }
@@ -672,11 +622,11 @@ case class Commitment(fundingTxIndex: Long,
     // remote commitment will include all local proposed changes + remote acked changes
     val spec = CommitmentSpec.reduce(remoteCommit.spec, changes.remoteChanges.acked, changes.localChanges.proposed)
     val (remoteCommitTx, htlcTxs) = Commitment.makeRemoteTxs(keyManager, params.channelConfig, params.channelFeatures, remoteCommit.index + 1, params.localParams, params.remoteParams, fundingTxIndex, remoteFundingPubKey, commitInput, remoteNextPerCommitmentPoint, spec)
-    val sig = keyManager.sign(remoteCommitTx, keyManager.fundingPublicKey(params.localParams.fundingKeyPath, fundingTxIndex), TxOwner.Remote, params.commitmentFormat)
+    val sig = keyManager.sign(remoteCommitTx, keyManager.fundingPublicKey(params.localParams.fundingKeyPath, fundingTxIndex), TxOwner.Remote, params.commitmentFormat, Map.empty)
 
     val sortedHtlcTxs: Seq[TransactionWithInputInfo] = htlcTxs.sortBy(_.input.outPoint.index)
     val channelKeyPath = keyManager.keyPath(params.localParams, params.channelConfig)
-    val htlcSigs = sortedHtlcTxs.map(keyManager.sign(_, keyManager.htlcPoint(channelKeyPath), remoteNextPerCommitmentPoint, TxOwner.Remote, params.commitmentFormat))
+    val htlcSigs = sortedHtlcTxs.map(keyManager.sign(_, keyManager.htlcPoint(channelKeyPath), remoteNextPerCommitmentPoint, TxOwner.Remote, params.commitmentFormat, Map.empty))
 
     // NB: IN/OUT htlcs are inverted because this is the remote commit
     log.info(s"built remote commit number=${remoteCommit.index + 1} toLocalMsat=${spec.toLocal.toLong} toRemoteMsat=${spec.toRemote.toLong} htlc_in={} htlc_out={} feeratePerKw=${spec.commitTxFeerate} txid=${remoteCommitTx.tx.txid} fundingTxId=$fundingTxId", spec.htlcs.collect(DirectedHtlc.outgoing).map(_.id).mkString(","), spec.htlcs.collect(DirectedHtlc.incoming).map(_.id).mkString(","))
@@ -709,7 +659,7 @@ case class Commitment(fundingTxIndex: Long,
   /** Return a fully signed commit tx, that can be published as-is. */
   def fullySignedLocalCommitTx(params: ChannelParams, keyManager: ChannelKeyManager): CommitTx = {
     val unsignedCommitTx = localCommit.commitTxAndRemoteSig.commitTx
-    val localSig = keyManager.sign(unsignedCommitTx, keyManager.fundingPublicKey(params.localParams.fundingKeyPath, fundingTxIndex), TxOwner.Local, params.commitmentFormat)
+    val localSig = keyManager.sign(unsignedCommitTx, keyManager.fundingPublicKey(params.localParams.fundingKeyPath, fundingTxIndex), TxOwner.Local, params.commitmentFormat, Map.empty)
     val RemoteSignature.FullSignature(remoteSig) = localCommit.commitTxAndRemoteSig.remoteSig
     val commitTx = addSigs(unsignedCommitTx, keyManager.fundingPublicKey(params.localParams.fundingKeyPath, fundingTxIndex).publicKey, remoteFundingPubKey, localSig, remoteSig)
     // We verify the remote signature when receiving their commit_sig, so this check should always pass.
@@ -890,6 +840,8 @@ case class Commitments(params: ChannelParams,
   def getOutgoingHtlcCrossSigned(htlcId: Long): Option[UpdateAddHtlc] = active.head.getOutgoingHtlcCrossSigned(htlcId)
   def getIncomingHtlcCrossSigned(htlcId: Long): Option[UpdateAddHtlc] = active.head.getIncomingHtlcCrossSigned(htlcId)
   // @formatter:on
+
+  def updateInitFeatures(localInit: Init, remoteInit: Init): Commitments = this.copy(params = params.updateFeatures(localInit, remoteInit))
 
   /**
    * @param cmd add HTLC command

@@ -22,7 +22,6 @@ import akka.actor.typed.scaladsl.adapter.{ClassicActorRefOps, ClassicActorSystem
 import akka.actor.{ActorRef, typed}
 import akka.pattern._
 import akka.util.Timeout
-import com.softwaremill.quicklens.ModifyPimp
 import fr.acinq.bitcoin.scalacompat.Crypto.PublicKey
 import fr.acinq.bitcoin.scalacompat.{BlockHash, ByteVector32, ByteVector64, Crypto, DeterministicWallet, OutPoint, Satoshi, Script, Transaction, TxId, addressToPublicKeyScript}
 import fr.acinq.eclair.ApiTypes.ChannelNotFound
@@ -31,16 +30,17 @@ import fr.acinq.eclair.balance.{BalanceActor, ChannelsListener}
 import fr.acinq.eclair.blockchain.OnChainWallet.OnChainBalance
 import fr.acinq.eclair.blockchain.bitcoind.ZmqWatcher.WatchFundingSpentTriggered
 import fr.acinq.eclair.blockchain.bitcoind.rpc.BitcoinCoreClient
-import fr.acinq.eclair.blockchain.bitcoind.rpc.BitcoinCoreClient.{Descriptors, WalletTx}
+import fr.acinq.eclair.blockchain.bitcoind.rpc.BitcoinCoreClient.{AddressType, Descriptors, WalletTx}
 import fr.acinq.eclair.blockchain.fee.{ConfirmationTarget, FeeratePerByte, FeeratePerKw}
 import fr.acinq.eclair.channel._
 import fr.acinq.eclair.crypto.Sphinx
 import fr.acinq.eclair.db.AuditDb.{NetworkFee, Stats}
-import fr.acinq.eclair.db.{IncomingPayment, OutgoingPayment, OutgoingPaymentStatus}
+import fr.acinq.eclair.db.{IncomingPayment, OfferData, OutgoingPayment, OutgoingPaymentStatus}
 import fr.acinq.eclair.io.Peer.{GetPeerInfo, OpenChannelResponse, PeerInfo}
 import fr.acinq.eclair.io._
 import fr.acinq.eclair.message.{OnionMessages, Postman}
 import fr.acinq.eclair.payment._
+import fr.acinq.eclair.payment.offer.{OfferCreator, OfferManager}
 import fr.acinq.eclair.payment.receive.MultiPartHandler.ReceiveStandardPayment
 import fr.acinq.eclair.payment.relay.Relayer.{ChannelBalance, GetOutgoingChannels, OutgoingChannels, RelayFees}
 import fr.acinq.eclair.payment.send.PaymentInitiator._
@@ -126,7 +126,13 @@ trait Eclair {
 
   def receive(description: Either[String, ByteVector32], amount_opt: Option[MilliSatoshi], expire_opt: Option[Long], fallbackAddress_opt: Option[String], paymentPreimage_opt: Option[ByteVector32], privateChannelIds_opt: Option[List[ByteVector32]])(implicit timeout: Timeout): Future[Bolt11Invoice]
 
-  def newAddress(): Future[String]
+  def createOffer(description_opt: Option[String], amount_opt: Option[MilliSatoshi], expire_opt: Option[Long], issuer_opt: Option[String], blindedPathsFirstNodeId_opt: Option[PublicKey])(implicit timeout: Timeout): Future[OfferData]
+
+  def disableOffer(offer: Offer)(implicit timeout: Timeout): Future[Map[ByteVector32, Boolean]]
+
+  def listOffers(onlyActive: Boolean = true)(implicit timeout: Timeout): Future[Seq[OfferData]]
+
+  def newAddress(addressType_opt: Option[AddressType] = None): Future[String]
 
   def receivedInfo(paymentHash: ByteVector32)(implicit timeout: Timeout): Future[Option[IncomingPayment]]
 
@@ -388,9 +394,28 @@ class EclairImpl(val appKit: Kit) extends Eclair with Logging with SpendFromChan
     }
   }
 
-  override def newAddress(): Future[String] = {
+  override def createOffer(description_opt: Option[String], amount_opt: Option[MilliSatoshi], expireInSeconds_opt: Option[Long], issuer_opt: Option[String], blindedPathsFirstNodeId_opt: Option[PublicKey])(implicit timeout: Timeout): Future[OfferData] = {
+    val offerCreator = appKit.system.spawnAnonymous(OfferCreator(appKit.nodeParams, appKit.router, appKit.offerManager, appKit.defaultOfferHandler))
+    val expiry_opt = expireInSeconds_opt.map(TimestampSecond.now() + _)
+    offerCreator.ask[OfferCreator.CreateOfferResult](replyTo => OfferCreator.Create(replyTo, description_opt, amount_opt, expiry_opt, issuer_opt, blindedPathsFirstNodeId_opt))
+      .flatMap {
+        case OfferCreator.CreateOfferError(reason) => Future.failed(new Exception(reason))
+        case OfferCreator.CreatedOffer(offer) => Future.successful(offer)
+      }
+  }
+
+  override def disableOffer(offer: Offer)(implicit timeout: Timeout): Future[Map[ByteVector32, Boolean]] = Future {
+    appKit.offerManager ! OfferManager.DisableOffer(offer)
+    Map(offer.offerId -> true)
+  }
+
+  override def listOffers(onlyActive: Boolean = true)(implicit timeout: Timeout): Future[Seq[OfferData]] = Future {
+    appKit.nodeParams.db.offers.listOffers(onlyActive)
+  }
+
+  override def newAddress(addressType_opt: Option[AddressType] = None): Future[String] = {
     appKit.wallet match {
-      case w: BitcoinCoreClient => w.getReceiveAddress()
+      case w: BitcoinCoreClient => w.getReceiveAddress(addressType_opt)
       case _ => Future.failed(new IllegalArgumentException("this call is only available with a bitcoin core backend"))
     }
   }
@@ -488,9 +513,10 @@ class EclairImpl(val appKit: Kit) extends Eclair with Logging with SpendFromChan
     val maxAttempts = maxAttempts_opt.getOrElse(appKit.nodeParams.maxPaymentAttempts)
     getRouteParams(pathFindingExperimentName_opt) match {
       case Right(defaultRouteParams) =>
-        val routeParams = defaultRouteParams
-          .modify(_.boundaries.maxFeeProportional).setToIfDefined(maxFeePct_opt.map(_ / 100))
-          .modify(_.boundaries.maxFeeFlat).setToIfDefined(maxFeeFlat_opt.map(_.toMilliSatoshi))
+        val routeParams = defaultRouteParams.copy(boundaries = defaultRouteParams.boundaries.copy(
+          maxFeeProportional = maxFeePct_opt.map(_ / 100).getOrElse(defaultRouteParams.boundaries.maxFeeProportional),
+          maxFeeFlat = maxFeeFlat_opt.map(_.toMilliSatoshi).getOrElse(defaultRouteParams.boundaries.maxFeeFlat)
+        ))
         externalId_opt match {
           case Some(externalId) if externalId.length > externalIdMaxLength => Left(new IllegalArgumentException(s"externalId is too long: cannot exceed $externalIdMaxLength characters"))
           case _ if invoice.isExpired() => Left(new IllegalArgumentException("invoice has expired"))
@@ -518,9 +544,10 @@ class EclairImpl(val appKit: Kit) extends Eclair with Logging with SpendFromChan
     val maxAttempts = maxAttempts_opt.getOrElse(appKit.nodeParams.maxPaymentAttempts)
     getRouteParams(pathFindingExperimentName_opt) match {
       case Right(defaultRouteParams) =>
-        val routeParams = defaultRouteParams
-          .modify(_.boundaries.maxFeeProportional).setToIfDefined(maxFeePct_opt.map(_ / 100))
-          .modify(_.boundaries.maxFeeFlat).setToIfDefined(maxFeeFlat_opt.map(_.toMilliSatoshi))
+        val routeParams = defaultRouteParams.copy(boundaries = defaultRouteParams.boundaries.copy(
+          maxFeeProportional = maxFeePct_opt.map(_ / 100).getOrElse(defaultRouteParams.boundaries.maxFeeProportional),
+          maxFeeFlat = maxFeeFlat_opt.map(_.toMilliSatoshi).getOrElse(defaultRouteParams.boundaries.maxFeeFlat)
+        ))
         val sendPayment = SendSpontaneousPayment(amount, recipientNodeId, paymentPreimage, maxAttempts, externalId_opt, routeParams)
         (appKit.paymentInitiator ? sendPayment).mapTo[UUID]
       case Left(t) => Future.failed(t)
@@ -753,9 +780,10 @@ class EclairImpl(val appKit: Kit) extends Eclair with Logging with SpendFromChan
     }
     val routeParams = getRouteParams(pathFindingExperimentName_opt) match {
       case Right(defaultRouteParams) =>
-        defaultRouteParams
-          .modify(_.boundaries.maxFeeProportional).setToIfDefined(maxFeePct_opt.map(_ / 100))
-          .modify(_.boundaries.maxFeeFlat).setToIfDefined(maxFeeFlat_opt.map(_.toMilliSatoshi))
+        defaultRouteParams.copy(boundaries = defaultRouteParams.boundaries.copy(
+          maxFeeProportional = maxFeePct_opt.map(_ / 100).getOrElse(defaultRouteParams.boundaries.maxFeeProportional),
+          maxFeeFlat = maxFeeFlat_opt.map(_.toMilliSatoshi).getOrElse(defaultRouteParams.boundaries.maxFeeFlat)
+        ))
       case Left(t) => return Future.failed(t)
     }
     val sendPaymentConfig = OfferPayment.SendPaymentConfig(externalId_opt, connectDirectly, maxAttempts_opt.getOrElse(appKit.nodeParams.maxPaymentAttempts), routeParams, blocking, trampolineNodeId_opt)
@@ -809,7 +837,7 @@ class EclairImpl(val appKit: Kit) extends Eclair with Logging with SpendFromChan
   }
 
   override def getOnChainMasterPubKey(account: Long): String = appKit.nodeParams.onChainKeyManager_opt match {
-    case Some(keyManager) => keyManager.masterPubKey(account)
+    case Some(keyManager) => keyManager.masterPubKey(account, AddressType.P2wpkh)
     case _ => throw new RuntimeException("on-chain seed is not configured")
   }
 
